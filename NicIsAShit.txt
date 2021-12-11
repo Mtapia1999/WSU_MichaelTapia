@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+
+#####################################################################
+# This script presents how to use the most basic features of the environment.
+# It configures the engine, and makes the agent perform random actions.
+# It also gets current state and reward earned with the action.
+# <episodes> number of episodes are played.
+# Random combination of buttons is chosen for every action.
+# Game variables from state and last reward are printed.
+#
+# To see the scenario description go to "../../scenarios/README.md"
+#####################################################################
+
+from __future__ import print_function
+import vizdoom as vzd
+
+from time import sleep
+import cv2
+import numpy as np
+import math
+
+if __name__ == "__main__":
+    # Create DoomGame instance. It will run the game and communicate with you.
+    game = vzd.DoomGame()
+
+    # Now it's time for configuration!
+    # load_config could be used to load configuration instead of doing it here with code.
+    # If load_config is used in-code configuration will also work - most recent changes will add to previous ones.
+    # game.load_config("../../scenarios/basic.cfg")
+
+    # Sets path to additional resources wad file which is basically your scenario wad.
+    # If not specified default maps will be used and it's pretty much useless... unless you want to play good old Doom.
+    # game.set_doom_scenario_path("../scenarios/basic.wad")
+    game.set_doom_scenario_path("../scenarios/deadly_corridor.wad")
+    # game.set_doom_scenario_path("../scenarios/health_gathering.wad")
+
+    # Sets map to start (scenario .wad files can contain many maps).
+    game.set_doom_map("map01")
+
+    # Sets resolution. Default is 320X240
+    game.set_screen_resolution(vzd.ScreenResolution.RES_640X480)
+
+    # Sets the screen buffer format. Not used here but now you can change it. Default is CRCGCB.
+    game.set_screen_format(vzd.ScreenFormat.BGR24)
+
+    # Enables depth buffer.
+    game.set_depth_buffer_enabled(True)
+
+    # Enables labeling of in game objects labeling.
+    game.set_labels_buffer_enabled(True)
+
+    # Enables buffer with top down map of the current episode/level.
+    game.set_automap_buffer_enabled(True)
+    game.set_automap_mode(vzd.AutomapMode.OBJECTS_WITH_SIZE)
+
+    # Enables information about all objects present in the current episode/level.
+    game.set_objects_info_enabled(True)
+
+    # Enables information about all sectors (map layout).
+    game.set_sectors_info_enabled(True)
+
+    # Sets other rendering options (all of these options except crosshair are enabled (set to True) by default)
+    game.set_render_hud(True)
+    game.set_render_minimal_hud(False)  # If hud is enabled
+    game.set_render_crosshair(False)
+    game.set_render_weapon(True)
+    game.set_render_decals(False)  # Bullet holes and blood on the walls
+    game.set_render_particles(False)
+    game.set_render_effects_sprites(False)  # Smoke and blood
+    game.set_render_messages(False)  # In-game messages
+    game.set_render_corpses(False)
+    game.set_render_screen_flashes(True)  # Effect upon taking damage or picking up items
+
+    # Adds buttons that will be allowed.
+    game.add_available_button(vzd.Button.TURN_RIGHT)
+    game.add_available_button(vzd.Button.TURN_LEFT)
+    game.add_available_button(vzd.Button.ATTACK)
+    game.add_available_button(vzd.Button.MOVE_FORWARD)
+
+    # Adds game variables that will be included in state.
+    game.add_available_game_variable(vzd.GameVariable.AMMO2)
+
+    # Causes episodes to finish after 200 tics (actions)
+    game.set_episode_timeout(1000)
+
+    # Makes episodes start after 10 tics (~after raising the weapon)
+    game.set_episode_start_time(10)
+
+    # Makes the window appear (turned on by default)
+    game.set_window_visible(True)
+
+    # Turns on the sound. (turned off by default)
+    game.set_sound_enabled(False)
+
+    # Sets the livin reward (for each move) to -1
+    game.set_living_reward(-1)
+
+    # Sets ViZDoom mode (PLAYER, ASYNC_PLAYER, SPECTATOR, ASYNC_SPECTATOR, PLAYER mode is default)
+    game.set_mode(vzd.Mode.PLAYER)
+
+    # Enables engine output to console.
+    # game.set_console_enabled(True)
+
+    enemies = []
+    items = []
+    knownE = False
+    knownO = False
+    closeEnemy = None
+    angCalc = False
+    enemy = 1
+
+    turn_right_bool = False
+    aimed_at = False
+    current_frame = 0
+    aimang = None
+
+    # Initialize the game. Further configuration won't take any effect from now on.
+    game.init()
+
+    shoot = [0, 0, 1, 0]
+    turn_left = [0, 1, 0, 0]
+    turn_right = [1, 0, 0, 0]
+    forward = [0, 0, 0, 1]
+    actions = [shoot, turn_left, turn_right]
+
+    # Run this many episodes
+    episodes = 10
+
+    # Sets time that will pause the engine after each action (in seconds)
+    # Without this everything would go too fast for you to keep track of what's happening.
+    sleep_time = 1.0 / vzd.DEFAULT_TICRATE  # = 0.028
+
+    # Prepare some colors and drawing function
+    # Colors in in BGR order
+    doom_red_color = [0, 0, 203]
+    doom_blue_color = [203, 0, 0]
+
+    def draw_bounding_box(buffer, x, y, width, height, color):
+        for i in range(width):
+            buffer[y, x + i, :] = color
+            buffer[y + height, x + i, :] = color
+
+        for i in range(height):
+            buffer[y + i, x, :] = color
+            buffer[y + i, x + width, :] = color
+
+    def color_labels(labels):
+        """
+        Walls are blue, floor/ceiling are red (OpenCV uses BGR).
+        """
+        tmp = np.stack([labels] * 3, -1)
+        tmp[labels == 0] = [255, 0, 0]
+        tmp[labels == 1] = [0, 0, 255]
+
+        return tmp
+
+    def target_new(closetarget, doomguy):
+        global turn_right_bool
+        global aimed_at
+        global current_frame
+        global aimang
+        test_time = 50
+        current_kc = game.get_game_variable(vzd.GameVariable.KILLCOUNT)
+
+        aimang = math.atan2(closetarget.position_y - doomguy.position_y,
+                            closetarget.position_x - doomguy.position_x) * 180 / math.pi
+        if aimang < 0:
+            aimang = 360 + aimang
+            if doomguy.angle == 0.0:
+                if aimang > 180:
+                    turn_right_bool = True
+            elif doomguy.angle < aimang:
+                turn_right_bool = True
+
+        print("angle to aim at: ", aimang)
+
+        if aimed_at is False:
+            if doomguy.angle <= (aimang - 2) or doomguy.angle >= (aimang + 2):
+                if turn_right_bool:
+                    game.make_action(turn_right)
+                else:
+                    game.make_action(turn_left)
+            else:
+                current_frame = game.get_state().number
+                turn_right_bool = False
+                aimed_at = True
+        else:
+            if (game.get_state().number - current_frame) < test_time:
+                game.make_action(shoot)
+
+                if game.get_game_variable(vzd.GameVariable.KILLCOUNT) != current_kc:
+                    enemies.append(closetarget.name)
+                    aimang = None
+                    aimed_at = False
+                    return None
+            else:
+                current_health = game.get_game_variable(vzd.GameVariable.HEALTH)
+                print("Failed to kill target in given number of frames. Now assuming target is item.")
+                game.make_action(forward)
+                if game.get_game_variable(vzd.GameVariable.HEALTH) > current_health:
+                    items.append(closetarget.name)
+                    aimang = None
+                    aimed_at = False
+                    return None
+
+        return closetarget
+
+    def target_enemy(closetarget, doomguy):
+        global turn_right_bool
+        global aimed_at
+        global current_frame
+        global aimang
+        current_kc = game.get_game_variable(vzd.GameVariable.KILLCOUNT)
+
+        aimang = math.atan2(closetarget.position_y - doomguy.position_y,
+                            closetarget.position_x - doomguy.position_x) * 180 / math.pi
+        if aimang < 0:
+            aimang = 360 + aimang
+            if doomguy.angle == 0.0:
+                if aimang > 180:
+                    turn_right_bool = True
+            elif doomguy.angle < aimang:
+                turn_right_bool = True
+
+        print("angle to aim at: ", aimang)
+
+        if aimed_at is False:
+            if doomguy.angle <= (aimang - 2) or doomguy.angle >= (aimang + 2):
+                if turn_right_bool:
+                    game.make_action(turn_right)
+                else:
+                    game.make_action(turn_left)
+            else:
+                current_frame = game.get_state().number
+                turn_right_bool = False
+                aimed_at = True
+        else:
+            game.make_action(shoot)
+
+            if game.get_game_variable(vzd.GameVariable.KILLCOUNT) != current_kc:
+                aimang = None
+                aimed_at = False
+                return None
+
+        return closetarget
+
+    def target_object(closetarget, doomguy):
+        global turn_right_bool
+        global aimed_at
+        global current_frame
+        global aimang
+        current_health = game.get_game_variable(vzd.GameVariable.HEALTH)
+
+        aimang = math.atan2(closetarget.position_y - doomguy.position_y,
+                            closetarget.position_x - doomguy.position_x) * 180 / math.pi
+        if aimang < 0:
+            aimang = 360 + aimang
+            if doomguy.angle == 0.0:
+                if aimang > 180:
+                    turn_right_bool = True
+            elif doomguy.angle - aimang < 0:
+                turn_right_bool = True
+
+        print("angle to aim at: ", aimang)
+
+        if aimed_at is False:
+            if doomguy.angle <= (aimang - 2) or doomguy.angle >= (aimang + 2):
+                if turn_right_bool:
+                    game.make_action(turn_right)
+                else:
+                    game.make_action(turn_left)
+            else:
+                current_frame = game.get_state().number
+                turn_right_bool = False
+                aimed_at = True
+        else:
+            game.make_action(forward)
+
+            if game.get_game_variable(vzd.GameVariable.HEALTH) > current_health:
+                aimang = None
+                aimed_at = False
+                return None
+
+        return closetarget
+
+    puffExists = 0
+
+    for i in range(episodes):
+        print("Episode #" + str(i + 1))
+        allObjects = []
+        closeEnemy = None
+        aimed_at = False
+        aimang = None
+
+        # Starts a new episode.
+        # It is not needed right after init() but it doesn't cost much. At least the loop is nicer.
+        game.new_episode()
+
+        while not game.is_episode_finished():
+
+            # Gets the state
+            state = game.get_state()
+
+            # Which consists of:
+            n = state.number
+            gVars = state.game_variables
+
+            allObjects = []
+            depth = state.depth_buffer
+            if depth is not None:
+                cv2.imshow('ViZDoom Depth Buffer', depth)
+
+            # Labels buffer, always in 8-bit gray channel format.
+            # Shows only visible game objects (enemies, pickups, exploding barrels etc.), each with unique label.
+            # Labels data are available in state.labels.
+            labels = state.labels_buffer
+            if labels is not None:
+                cv2.imshow('ViZDoom Labels Buffer', color_labels(labels))
+
+            # Screen buffer, given in selected format. This buffer is always available.
+            # Using information from state.labels draw bounding boxes.
+            img = state.screen_buffer
+            for lb in state.labels:
+                if lb.object_id == closeEnemy:
+                    draw_bounding_box(img, lb.x, lb.y, lb.width, lb.height, doom_red_color)
+            cv2.imshow('ViZDoom Screen Buffer', img)
+
+            automap = state.automap_buffer
+            if automap is not None:
+                cv2.imshow('ViZDoom Map Buffer', automap)
+
+            labels = state.labels
+            objects = state.objects
+            doomguy = objects
+
+            print("State #" + str(n))
+            print("Game variables:", gVars)
+            print("=====================")
+
+            for o in objects:
+                if o.name == "DoomPlayer":
+                    print("DoomGuy angle: ", o.angle)
+                    doomguy = o
+                elif o.name == "BulletPuff":
+                    print("BulletPuff Detected", )
+                elif o.name == "Blood":
+                    print("Blood Detected", )
+                else:
+                    allObjects.append(o)
+
+            if closeEnemy is None:
+                closeEnemy = allObjects[0]
+                distance = math.sqrt(((closeEnemy.position_x - doomguy.position_x)**2)
+                                     + ((closeEnemy.position_y - doomguy.position_y)**2))
+
+                for o in allObjects:
+                    new_distance = math.sqrt(((o.position_x - doomguy.position_x)**2)
+                                             + ((o.position_y - doomguy.position_y)**2))
+                    if new_distance < distance:
+                        if o.name != "DeadZombieman":
+                            distance = new_distance
+                            closeEnemy = o
+
+            if closeEnemy is not None:
+                print("Current Target is", closeEnemy.name)
+
+                if knownE is True:
+                    print("Current Target is a known enemy")
+                    closeEnemy = target_enemy(closeEnemy, doomguy)
+                elif enemies is not None:
+                    for o in enemies:
+                        if o == closeEnemy.name:
+                            knownE = True
+                            print("Current Target is a known enemy")
+                            closeEnemy = target_enemy(closeEnemy, doomguy)
+                        else:
+                            knownE = False
+
+                if knownO is True:
+                    print("Current Target is a known object")
+                    closeEnemy = target_object(closeEnemy, doomguy)
+                elif items is not None:
+                    for o in items:
+                        if o == closeEnemy.name:
+                            knownO = True
+                            print("Current Target is a known object")
+                            closeEnemy = target_object(closeEnemy, doomguy)
+                        else:
+                            knownO = False
+
+                if knownE is False and knownO is False:
+                    print("Current Target is an unknown entity")
+                    closeEnemy = target_new(closeEnemy, doomguy)
+
+            cv2.waitKey(int(sleep_time * 1000))
+
+            if sleep_time > 0:
+                sleep(sleep_time)
+
+            print(enemies)
+            print(items)
+
+            # Check how the episode went.
+        print("Episode finished.")
+        print("Total reward:", game.get_total_reward())
+        print("************************")
+
+    # It will be done automatically anyway but sometimes you need to do it in the middle of the program...
+    game.close()
